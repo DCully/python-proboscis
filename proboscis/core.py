@@ -169,7 +169,6 @@ class TestEntry(object):
                     raise RuntimeError("TestEntry depends on a group it " \
                                        "itself belongs to: " + str(self))
 
-
     def contains(self, group_names, classes):
         """True if this belongs to any of the given groups or classes."""
         for group_name in group_names:
@@ -201,6 +200,13 @@ class TestEntry(object):
         self.__method = method
         self.__method_cls = cls
         self.homes = set([self.home, cls])
+
+    def get_method_name(self):
+        """ Returns the stringified version of __method_cls, prettified up.
+        (Added by David Cully, Adelphic Inc, January 2015) """
+        # example raw: <class '__main__.MyFancyTestClassName'>
+        raw = str(self.__method_cls)
+        return raw[raw.find(".") + 1:raw.find(">") - 1]
 
     def mark_as_used_by_factory(self):
         """If a Factory returns an instance of a class, the class will not

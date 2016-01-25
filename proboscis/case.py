@@ -51,7 +51,9 @@ class TestPlan(object):
 
     @staticmethod
     def create_from_registry(registry):
-        """Returns a sorted TestPlan from a TestRegistry instance."""
+        """Returns a sorted TestPlan from a TestRegistry instance.
+        If use_group_intersection is False, we generate a test plan from the union of all groups involved.
+        If use_group_intersection is True, we use the intersection instead. """
         return TestPlan(registry.groups, registry.tests, registry.factories)
 
     @staticmethod
@@ -136,7 +138,7 @@ class TestPlan(object):
                     suite.addTest(test)
         return suite
 
-    def filter(self, group_names=None, classes=None, functions=None):
+    def filter(self, group_names=None, classes=None, functions=None, filter_by_group_intersection=False):
         """Whittles down test list to those matching criteria."""
         test_homes = []
         classes = classes or []
@@ -147,6 +149,9 @@ class TestPlan(object):
             test_homes.append(function)
         group_names = group_names or []
         filtered_list = []
+        if filter_by_group_intersection and len(group_names) > 0:
+            # this method manipulates self.tests (thinning it out, basically)
+            self.filter_internal_test_cases_by_group_intersection(group_names)
         while self.tests:
             case = self.tests.pop()
             if case.entry.contains(group_names, test_homes):
@@ -159,6 +164,18 @@ class TestPlan(object):
                     if not test_home in test_homes:
                         test_homes.append(test_home)
         self.tests = list(reversed(filtered_list))
+
+    def filter_internal_test_cases_by_group_intersection(self, cli_inputted_group_names):
+        """ Filters the internal self.tests list to remove any tests which do not match ALL inputted group names. """
+        filtered_tests = []
+        for test in self.tests:
+            all_target_groups_matched = True
+            for group in cli_inputted_group_names:
+                if group not in test.entry.info.groups:
+                    all_target_groups_matched = False
+            if all_target_groups_matched:
+                filtered_tests.append(test)
+        self.tests = filtered_tests
 
 
 class TestCase(object):
@@ -226,10 +243,6 @@ class TestResultListener():
         self.onError(test)
         self.chain_to_cls.addFailure(self, test, err)
 
-    def addSkip(self, test, err):
-        self.onError(test)
-        self.chain_to_cls.addSkip(self, test, err)
-
     def onError(self, test):
         """Notify a test entry and its dependents of failure."""
         if dependencies.use_nose:
@@ -239,7 +252,6 @@ class TestResultListener():
         if hasattr(root, "__proboscis_case__"):
             case = root.__proboscis_case__
             case.fail_test()
-
 
 
 class TestResult(TestResultListener, dependencies.TextTestResult):
@@ -337,11 +349,11 @@ class TestMethodState(object):
             self.instance = self.entry.home()
         return self.instance
 
-
 class MethodTest(unittest.FunctionTestCase):
     """Wraps a method as a test runnable by unittest."""
 
-    def __init__(self, test_case):
+    def __init__(self, test_case, containing_class_name):
+        self.containing_class_name = str(containing_class_name)
         assert test_case.state is not None
         #TODO: Figure out how to attach calls to BeforeMethod and BeforeClass,
         #      AfterMethod and AfterClass. It should be easy enough to
@@ -355,6 +367,9 @@ class MethodTest(unittest.FunctionTestCase):
         self.__proboscis_case__ = test_case
         sfunc = skippable_func(self, func)
         unittest.FunctionTestCase.__init__(self, testFunc=sfunc, setUp=cb_check)
+
+    def id(self):
+        return "%s.%s" % (self.containing_class_name, str(self._testFunc.__name__))
 
 
 def decorate_class(setUp_method=None, tearDown_method=None):
@@ -408,7 +423,8 @@ class TestSuiteCreator(object):
             return self.wrap_unittest_test_case_class(test_case)
         if isinstance(home, types.FunctionType):
             if home._proboscis_entry_.is_child:
-                return self.wrap_method(test_case)
+                return self.wrap_method(test_case, home._proboscis_entry_.get_method_name())
+
             else:
                 return self.wrap_function(test_case)
         raise RuntimeError("Unknown test type:" + str(type(home)))
@@ -416,8 +432,8 @@ class TestSuiteCreator(object):
     def wrap_function(self, test_case):
         return [FunctionTest(test_case)]
 
-    def wrap_method(self, test_case):
-        return [MethodTest(test_case)]
+    def wrap_method(self, test_case, container_class_name):
+        return [MethodTest(test_case, container_class_name)]
 
     def wrap_unittest_test_case_class(self, test_case):
         original_cls = test_case.entry.home
@@ -469,7 +485,7 @@ class TestProgram(dependencies.TestProgram):
                        addFailure and addError methods.
     :param stream: By default this is standard out.
     :param argv: By default this is sys.argv. Proboscis parses this for the
-                 --group argument.
+                 --group argument and the --use-group-intersection argument.
     """
     def __init__(self,
                  registry=DEFAULT_REGISTRY,
@@ -484,7 +500,10 @@ class TestProgram(dependencies.TestProgram):
                  *args, **kwargs):
         groups = groups or []
         argv = argv or sys.argv
-        argv = self.extract_groups_from_argv(argv, groups)
+        filter_by_group_intersection = self.extract_filter_by_group_intersection_from_argv(argv)
+        if "--use-group-intersection" in argv:
+            argv.remove("--use-group-intersection")
+        argv = self.extract_groups_from_argv(argv, groups)  # changes argv
         if "suite" in kwargs:
             raise ValueError("'suite' is not a valid argument, as Proboscis " \
                              "creates the suite.")
@@ -517,7 +536,8 @@ class TestProgram(dependencies.TestProgram):
         self.plan = TestPlan.create_from_registry(registry)
 
         if len(groups) > 0:
-            self.plan.filter(group_names=groups)
+            self.plan.filter(group_names=groups, filter_by_group_intersection=filter_by_group_intersection)
+
         self.cases = self.plan.tests
         if "--show-plan" in argv:
             self.__run = self.show_plan
@@ -571,6 +591,16 @@ class TestProgram(dependencies.TestProgram):
             else:
                 new_argv.append(arg)
         return new_argv
+
+    def extract_filter_by_group_intersection_from_argv(self, argv):
+        """ Determines from CLI arguments whether or not to filter by group intersection (default is union)
+        :param argv: A list of command line arguments, such as sys.argv
+        :return: True or False
+        """
+        for arg in argv[1:]:
+            if str(arg).lower() == "--use-group-intersection":
+                return True
+        return False
 
     def run_and_exit(self):
         """Calls unittest or Nose to run all tests.
